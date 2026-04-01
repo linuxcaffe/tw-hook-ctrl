@@ -1,0 +1,8 @@
+[tw-hook-ctrl]
+version = 0.1.0
+description = ncurses TUI for toggling Taskwarrior hook permissions
+type = script
+timing = manual
+debug = false
+skip = false
+files = hook-ctrl.py:script

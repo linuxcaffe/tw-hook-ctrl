@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# tw-hook-ctrl installer
+# Part of the awesome-taskwarrior suite
+# https://github.com/linuxcaffe/tw-hook-ctrl
+
+VERSION="0.1.0"
+APP="tw-hook-ctrl"
+TASK_DIR="${TASK_DIR:-$HOME/.task}"
+SCRIPTS_DIR="$TASK_DIR/scripts"
+INSTALL_NAME="hook-ctrl"
+
+echo "$APP v$VERSION installer"
+echo "Installing to: $SCRIPTS_DIR/$INSTALL_NAME"
+
+mkdir -p "$SCRIPTS_DIR"
+
+# Download or copy hook-ctrl.py
+if command -v curl &>/dev/null; then
+    curl -fsSL "https://raw.githubusercontent.com/linuxcaffe/tw-hook-ctrl/main/hook-ctrl.py" \
+        -o "$SCRIPTS_DIR/$INSTALL_NAME"
+elif command -v wget &>/dev/null; then
+    wget -qO "$SCRIPTS_DIR/$INSTALL_NAME" \
+        "https://raw.githubusercontent.com/linuxcaffe/tw-hook-ctrl/main/hook-ctrl.py"
+else
+    echo "ERROR: curl or wget required" >&2
+    exit 1
+fi
+
+chmod +x "$SCRIPTS_DIR/$INSTALL_NAME"
+
+echo "Installed: $SCRIPTS_DIR/$INSTALL_NAME"
+echo "Run: hook-ctrl   (or add $SCRIPTS_DIR to PATH)"
