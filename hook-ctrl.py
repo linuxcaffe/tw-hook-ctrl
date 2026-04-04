@@ -84,31 +84,39 @@ else:
 
 VERSION = "0.1.0"
 
-HOOK_TYPES = {
-    'on-add':    ('on-add   ', 1),
-    'on-modify': ('on-modify', 2),
-    'on-exit':   ('on-exit  ', 3),
-    'on-launch': ('on-launch', 4),
-}
-
 # Color pair indices
-CP_ENABLED  = 1   # green  — active hook
-CP_DISABLED = 2   # red    — inactive hook
-CP_ADD      = 3   # cyan   — on-add
-CP_MODIFY   = 4   # yellow — on-modify
+CP_ENABLED  = 1   # green   — active hook
+CP_DISABLED = 2   # red     — inactive hook
+CP_ADD      = 3   # cyan    — on-add
+CP_MODIFY   = 4   # yellow  — on-modify
 CP_EXIT     = 5   # magenta — on-exit
-CP_LAUNCH   = 6   # blue   — on-launch
+CP_LAUNCH   = 6   # blue    — on-launch
 CP_SELECTED = 7   # reverse — cursor row
 CP_HEADER   = 8   # bold white
 CP_STATUS   = 9   # status bar
 CP_SYMLINK  = 10  # dim — symlink indicator
 CP_UNRECOG  = 11  # dim — unrecognized hook name
 
+# Procedural order: launch → add → modify → exit
+# Tuple: (display_label, color_pair_index, sort_order)
+HOOK_TYPES = {
+    'on-launch': ('on-launch', CP_LAUNCH, 1),
+    'on-add':    ('on-add   ', CP_ADD,    2),
+    'on-modify': ('on-modify', CP_MODIFY, 3),
+    'on-exit':   ('on-exit  ', CP_EXIT,   4),
+}
 
-def get_hooks_dir(override=None):
+
+def get_hooks_dir(override=None, dev=False):
     """Return the hooks directory Path."""
     if override:
         return Path(override).expanduser()
+    if dev:
+        return Path.home() / '.task-dev' / 'hooks'
+    # Respect TW_TASK_DIR if set (e.g. when invoked via `td hook-ctrl`)
+    tw_task_dir = os.environ.get('TW_TASK_DIR')
+    if tw_task_dir:
+        return Path(tw_task_dir) / 'hooks'
     try:
         result = subprocess.run(
             ['task', '_get', 'rc.data.location'],
@@ -124,10 +132,18 @@ def get_hooks_dir(override=None):
 
 def hook_type(name):
     """Return (label, color_pair_index, is_recognized) for a hook filename."""
-    for prefix, (label, cp) in HOOK_TYPES.items():
+    for prefix, (label, cp, _order) in HOOK_TYPES.items():
         if name.startswith(prefix):
             return label, cp, True
     return '?        ', CP_UNRECOG, False
+
+
+def _hook_sort_key(name):
+    """Sort key: (type_order, name) — groups hooks by procedural type."""
+    for prefix, (_label, _cp, order) in HOOK_TYPES.items():
+        if name.startswith(prefix):
+            return (order, name)
+    return (99, name)  # unrecognized hooks sort last
 
 
 def load_hooks(hooks_dir):
@@ -135,7 +151,7 @@ def load_hooks(hooks_dir):
     hooks = []
     if not hooks_dir.exists():
         return hooks
-    for f in sorted(hooks_dir.iterdir()):
+    for f in sorted(hooks_dir.iterdir(), key=lambda f: _hook_sort_key(f.name)):
         if not f.is_file() and not f.is_symlink():
             continue
         if f.name.startswith('.'):
@@ -341,10 +357,12 @@ def main():
     )
     parser.add_argument('--dir', metavar='PATH',
                         help='hooks directory (default: from active TASKRC)')
+    parser.add_argument('--dev', action='store_true',
+                        help='use ~/.task-dev/hooks (dev environment)')
     parser.add_argument('--version', action='version', version=f'%(prog)s {VERSION}')
     args = parser.parse_args()
 
-    hooks_dir = get_hooks_dir(args.dir)
+    hooks_dir = get_hooks_dir(args.dir, dev=args.dev)
 
     if not hooks_dir.exists():
         print(f"Hooks directory not found: {hooks_dir}", file=sys.stderr)
