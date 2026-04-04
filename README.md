@@ -12,7 +12,6 @@ A visual dashboard for seeing which Taskwarrior hooks are active and toggling th
 - Hooks grouped by type in procedural order: launch → add → modify → exit
 - Color-coded by hook type; enabled/disabled status shown with a clear indicator
 - Enable or disable all hooks at once with `e` / `d`
-- `--dev` flag targets `~/.task-dev/hooks`; `td hook-ctrl` auto-routes there via `TW_TASK_DIR`
 - `--dir PATH` for any custom hooks directory
 - Requires Taskwarrior 2.6.0+, Python 3.6+
 
@@ -61,7 +60,6 @@ hook-ctrl --version
 
 ```bash
 hook-ctrl              # hooks from active TASKRC
-hook-ctrl --dev        # ~/.task-dev/hooks (dev environment)
 hook-ctrl --dir PATH   # any hooks directory
 td hook-ctrl           # dev hooks via TW_TASK_DIR — no flag needed
 ```
@@ -92,18 +90,14 @@ The header shows the active hooks directory and the enabled/total count.
 Diagnosing a slow `task add`:
 
 ```
-1.  hook-ctrl --dev            # open the dev hooks dashboard
+1.  hook-ctrl                  # open the dev hooks dashboard
 2.  Navigate to on-add hooks
 3.  Space                      # disable the suspect hook
 4.  q                          # quit
-5.  td add "test task"         # time the operation
-6.  hook-ctrl --dev            # re-open
+5.  task add "test task"       # time the operation
+6.  hook-ctrl                  # re-open
 7.  Space                      # re-enable when done
 ```
-
-The same approach works in production: `hook-ctrl`, disable, test, re-enable.
-No `chmod` commands, no directory navigation, no risk of leaving a hook in the
-wrong state by accident.
 
 ## Project status
 
