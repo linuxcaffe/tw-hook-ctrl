@@ -12,13 +12,18 @@ if _os_timing.environ.get('TW_TIMING'):
     _atexit.register(_report_timing)
 
 """
-hook-ctrl — ncurses TUI for toggling Taskwarrior hook permissions
+hook-ctrl — unified TUI dashboard for Taskwarrior hooks, scripts, and includes
 Part of the awesome-taskwarrior suite.
 
+Three panels:
+  Left   — hooks in ~/.task/hooks/         (toggle executable bit)
+  Middle — scripts in ~/.task/scripts/     (toggle executable bit)
+  Right  — include= tree from .taskrc      (toggle comment character)
+
 Usage:
-  hook-ctrl              # use hooks dir from active TASKRC
-  hook-ctrl --dir PATH   # specify hooks directory
-  hook-ctrl --help
+  hook-ctrl              # auto-detect dirs from active TASKRC
+  hook-ctrl --dir PATH   # override hooks directory
+  hook-ctrl --dev        # use ~/.task-dev/ (dev environment)
 """
 
 # ============================================================================
@@ -29,9 +34,6 @@ import os
 import sys
 from pathlib import Path
 from datetime import datetime
-import curses
-import stat
-import subprocess
 
 # Debug configuration (default 0, triggered by tw --debug=2)
 DEBUG_MODE = 0
@@ -45,8 +47,9 @@ except ValueError:
 debug_active = DEBUG_MODE == 1 or tw_debug_level >= 2
 
 def get_log_dir():
-    """Hooks always log to ~/.task/logs/debug/"""
-    log_dir = Path.home() / '.task' / 'logs' / 'debug'
+    """Log dir respects TW_TASK_DIR for dev/test isolation."""
+    task_dir = Path(os.environ.get('TW_TASK_DIR', str(Path.home() / '.task')))
+    log_dir = task_dir / 'logs' / 'debug'
     log_dir.mkdir(parents=True, exist_ok=True)
     return log_dir
 
@@ -55,18 +58,17 @@ if debug_active:
     DEBUG_SESSION_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
     try:
         script_name = Path(__file__).stem
-    except:
+    except Exception:
         script_name = Path(sys.argv[0]).stem if sys.argv else "script"
     DEBUG_LOG_FILE = DEBUG_LOG_DIR / f"{script_name}_debug_{DEBUG_SESSION_ID}.log"
-    
+
     def debug_log(message, level=1):
         if debug_active and tw_debug_level >= level:
             timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-            log_line = f"{timestamp} [DEBUG-{level}] {message}\n"
             with open(DEBUG_LOG_FILE, "a") as f:
-                f.write(log_line)
+                f.write(f"{timestamp} [DEBUG-{level}] {message}\n")
             print(f"\033[34m[DEBUG-{level}]\033[0m {message}", file=sys.stderr)
-    
+
     with open(DEBUG_LOG_FILE, "w") as f:
         f.write("=" * 70 + "\n")
         f.write(f"Debug Session - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
@@ -82,23 +84,36 @@ else:
 # Original Code
 # ============================================================================
 
-VERSION = "0.1.0"
+import re
+import curses
+import stat
+import subprocess
+
+VERSION = "0.2.0"
+
+# Panel widths (includes panel gets the remainder)
+HOOKS_W   = 38
+SCRIPTS_W = 38
+MIN_W     = HOOKS_W + SCRIPTS_W + 22   # minimum useful terminal width
+
+HDR_ROWS  = 2   # global header row + panel-title row
 
 # Color pair indices
-CP_ENABLED  = 1   # green   — active hook
-CP_DISABLED = 2   # red     — inactive hook
-CP_ADD      = 3   # cyan    — on-add
-CP_MODIFY   = 4   # yellow  — on-modify
-CP_EXIT     = 5   # magenta — on-exit
-CP_LAUNCH   = 6   # blue    — on-launch
-CP_SELECTED = 7   # reverse — cursor row
-CP_HEADER   = 8   # bold white
-CP_STATUS   = 9   # status bar
-CP_SYMLINK  = 10  # dim — symlink indicator
-CP_UNRECOG  = 11  # dim — unrecognized hook name
+CP_ENABLED  = 1    # green   — executable / active include
+CP_DISABLED = 2    # red     — not executable / commented include
+CP_ADD      = 3    # cyan    — on-add hook type
+CP_MODIFY   = 4    # yellow  — on-modify hook type
+CP_EXIT     = 5    # magenta — on-exit hook type
+CP_LAUNCH   = 6    # blue    — on-launch hook type
+CP_SEL_FOC  = 7    # black on cyan  — focused panel selection
+CP_HEADER   = 8    # white on blue  — global header / popup title
+CP_STATUS   = 9    # black on green — status bar
+CP_UNRECOG  = 10   # dim — unrecognized hook name
+CP_SEL_UNF  = 11   # white on black — unfocused panel selection
+CP_SUBHEAD  = 12   # white on blue  — include section subheadings
+CP_PTITLE   = 13   # focused / unfocused panel title row
 
 # Procedural order: launch → add → modify → exit
-# Tuple: (display_label, color_pair_index, sort_order)
 HOOK_TYPES = {
     'on-launch': ('on-launch', CP_LAUNCH, 1),
     'on-add':    ('on-add   ', CP_ADD,    2),
@@ -106,14 +121,39 @@ HOOK_TYPES = {
     'on-exit':   ('on-exit  ', CP_EXIT,   4),
 }
 
+SKIP_EXTS  = {'.pyc', '.pyo', '.md', '.txt', '.rst'}
+SKIP_NAMES = {'__pycache__', '.gitignore', '.git'}
+
+_INC_RE = re.compile(r'^(\s*)(#\s*)?include\s+(\S+)', re.IGNORECASE)
+
+
+# ── Colors ─────────────────────────────────────────────────────────────────────
+
+def init_colors():
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(CP_ENABLED,  curses.COLOR_GREEN,   -1)
+    curses.init_pair(CP_DISABLED, curses.COLOR_RED,     -1)
+    curses.init_pair(CP_ADD,      curses.COLOR_CYAN,    -1)
+    curses.init_pair(CP_MODIFY,   curses.COLOR_YELLOW,  -1)
+    curses.init_pair(CP_EXIT,     curses.COLOR_MAGENTA, -1)
+    curses.init_pair(CP_LAUNCH,   curses.COLOR_BLUE,    -1)
+    curses.init_pair(CP_SEL_FOC,  curses.COLOR_BLACK,   curses.COLOR_CYAN)
+    curses.init_pair(CP_HEADER,   curses.COLOR_WHITE,   curses.COLOR_BLUE)
+    curses.init_pair(CP_STATUS,   curses.COLOR_BLACK,   curses.COLOR_GREEN)
+    curses.init_pair(CP_UNRECOG,  curses.COLOR_WHITE,   -1)
+    curses.init_pair(CP_SEL_UNF,  curses.COLOR_WHITE,   curses.COLOR_BLACK)
+    curses.init_pair(CP_SUBHEAD,  curses.COLOR_WHITE,   curses.COLOR_BLUE)
+    curses.init_pair(CP_PTITLE,   curses.COLOR_WHITE,   curses.COLOR_BLACK)
+
+
+# ── Directory / path resolution ────────────────────────────────────────────────
 
 def get_hooks_dir(override=None, dev=False):
-    """Return the hooks directory Path."""
     if override:
         return Path(override).expanduser()
     if dev:
         return Path.home() / '.task-dev' / 'hooks'
-    # Respect TW_TASK_DIR if set (e.g. when invoked via `td hook-ctrl`)
     tw_task_dir = os.environ.get('TW_TASK_DIR')
     if tw_task_dir:
         return Path(tw_task_dir) / 'hooks'
@@ -130,8 +170,35 @@ def get_hooks_dir(override=None, dev=False):
     return Path.home() / '.task' / 'hooks'
 
 
+def get_scripts_dir(dev=False):
+    if dev:
+        return Path.home() / '.task-dev' / 'scripts'
+    tw_task_dir = os.environ.get('TW_TASK_DIR')
+    if tw_task_dir:
+        return Path(tw_task_dir) / 'scripts'
+    return Path.home() / '.task' / 'scripts'
+
+
+def get_taskrc():
+    if 'TASKRC' in os.environ:
+        return Path(os.environ['TASKRC'])
+    return Path.home() / '.taskrc'
+
+
+def get_included_rc(dev=False):
+    tw_task_dir = os.environ.get('TW_TASK_DIR')
+    if tw_task_dir:
+        base = Path(tw_task_dir)
+    elif dev:
+        base = Path.home() / '.task-dev'
+    else:
+        base = Path.home() / '.task'
+    return base / 'config' / 'included.rc'
+
+
+# ── Hooks ──────────────────────────────────────────────────────────────────────
+
 def hook_type(name):
-    """Return (label, color_pair_index, is_recognized) for a hook filename."""
     for prefix, (label, cp, _order) in HOOK_TYPES.items():
         if name.startswith(prefix):
             return label, cp, True
@@ -139,15 +206,13 @@ def hook_type(name):
 
 
 def _hook_sort_key(name):
-    """Sort key: (type_order, name) — groups hooks by procedural type."""
     for prefix, (_label, _cp, order) in HOOK_TYPES.items():
         if name.startswith(prefix):
             return (order, name)
-    return (99, name)  # unrecognized hooks sort last
+    return (99, name)
 
 
 def load_hooks(hooks_dir):
-    """Return sorted list of dicts: {path, name, executable, symlink, recognized}"""
     hooks = []
     if not hooks_dir.exists():
         return hooks
@@ -160,18 +225,38 @@ def load_hooks(hooks_dir):
         is_sym  = f.is_symlink()
         _, _, recognized = hook_type(f.name)
         hooks.append({
-            'path':       f,
-            'name':       f.name,
-            'executable': is_exec,
-            'symlink':    is_sym,
-            'recognized': recognized,
+            'path': f, 'name': f.name,
+            'executable': is_exec, 'symlink': is_sym, 'recognized': recognized,
         })
     return hooks
 
 
-def toggle(hook):
-    """Toggle executable bit on a hook file."""
-    path = hook['path']
+# ── Scripts ────────────────────────────────────────────────────────────────────
+
+def load_scripts(scripts_dir):
+    scripts = []
+    if not scripts_dir.exists():
+        return scripts
+    for f in sorted(scripts_dir.iterdir(), key=lambda f: f.name.lower()):
+        if not f.is_file() and not f.is_symlink():
+            continue
+        if f.name.startswith('.'):
+            continue
+        if f.name in SKIP_NAMES or f.suffix in SKIP_EXTS:
+            continue
+        is_exec = os.access(f, os.X_OK)
+        is_sym  = f.is_symlink()
+        scripts.append({
+            'path': f, 'name': f.name,
+            'executable': is_exec, 'symlink': is_sym,
+        })
+    return scripts
+
+
+# ── Shared exec toggle ─────────────────────────────────────────────────────────
+
+def toggle_exec(item):
+    path = item['path']
     m = path.stat().st_mode
     if m & stat.S_IXUSR:
         path.chmod(m & ~(stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH))
@@ -179,197 +264,736 @@ def toggle(hook):
         path.chmod(m | (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH))
 
 
-def set_all(hooks, enable):
-    """Enable or disable all hooks."""
-    for h in hooks:
-        m = h['path'].stat().st_mode
+def set_all_exec(items, enable):
+    for item in items:
+        m = item['path'].stat().st_mode
         if enable:
-            h['path'].chmod(m | (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH))
+            item['path'].chmod(m | (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH))
         else:
-            h['path'].chmod(m & ~(stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH))
+            item['path'].chmod(m & ~(stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH))
 
 
-def draw(stdscr, hooks, cursor, scroll, hooks_dir, message=''):
-    stdscr.erase()
-    h, w = stdscr.getmaxyx()
+# ── Includes ───────────────────────────────────────────────────────────────────
 
-    active = sum(1 for hk in hooks if hk['executable'])
-    total  = len(hooks)
+def walk_includes(start_path, max_depth=10):
+    """Recursively walk the include tree from start_path.
 
-    # ── Header ───────────────────────────────────────────────────────────────
-    hdr_left  = f"  hook-ctrl v{VERSION}  {hooks_dir}"
-    hdr_right = f"{active}/{total} active  "
-    stdscr.addstr(0, 0, hdr_left[:w-1], curses.color_pair(CP_HEADER))
-    if len(hdr_right) < w:
-        stdscr.addstr(0, w - len(hdr_right), hdr_right, curses.color_pair(CP_HEADER))
+    Collects only include= lines (no other config).  Returns a flat list of
+    items in display order, each either a section header or an include line:
 
-    # ── Column labels ─────────────────────────────────────────────────────────
-    stdscr.addstr(1, 2, f"  {'TYPE':<11} {'ST':5}  FILENAME", curses.A_DIM)
+      {'type': 'header',  'source': Path}
+      {'type': 'include', 'source': Path, 'line_idx': int,
+       'text': str, 'active': bool, 'target': Path}
 
-    # ── Hook list ─────────────────────────────────────────────────────────────
-    list_top    = 2
-    list_height = h - 4   # header + col labels + status bar + 1 spare
+    Files with no include lines produce no header.
+    Depth-limited and visited-set guarded against cycles.
+    """
+    visited = set()
+    result  = []
+
+    def _walk(path, depth):
+        if depth > max_depth:
+            return
+        try:
+            canon = str(path.resolve())
+        except Exception:
+            canon = str(path)
+        if canon in visited:
+            return
+        visited.add(canon)
+
+        try:
+            lines = path.read_text().splitlines()
+        except Exception:
+            return
+
+        section = []
+        for i, line in enumerate(lines):
+            m = _INC_RE.match(line)
+            if not m:
+                continue
+            commented = bool(m.group(2))
+            target    = Path(m.group(3)).expanduser()
+            section.append({
+                'type':     'include',
+                'source':   path,
+                'line_idx': i,
+                'text':     line,
+                'active':   not commented,
+                'target':   target,
+            })
+
+        if section:
+            result.append({'type': 'header', 'source': path})
+            result.extend(section)
+            for item in section:
+                if item['active']:
+                    _walk(item['target'], depth + 1)
+
+    _walk(start_path, 0)
+    return result
+
+
+def toggle_include(item):
+    """Toggle comment/uncomment on an include line in its source file.
+    Returns (ok, message).
+    """
+    source = item['source']
+    if not os.access(source, os.W_OK):
+        return False, f"Read-only: {source.name}"
+    try:
+        lines = source.read_text().splitlines(keepends=True)
+        line  = lines[item['line_idx']]
+        if item['active']:
+            lines[item['line_idx']] = '#' + line
+        else:
+            lines[item['line_idx']] = re.sub(r'^#\s*', '', line)
+        source.write_text(''.join(lines))
+        return True, ''
+    except Exception as e:
+        return False, str(e)
+
+
+def migrate_includes(taskrc, included_rc):
+    """Move active include= lines from taskrc into included_rc.
+
+    In taskrc: comments out the moved lines and appends
+    'include <included_rc>' (if not already present).
+    Returns (count_moved, error_str).
+    """
+    try:
+        lines = taskrc.read_text().splitlines(keepends=True)
+    except Exception as e:
+        return 0, str(e)
+
+    to_move    = []
+    new_lines  = []
+    has_inc_rc = False
+
+    for line in lines:
+        m = _INC_RE.match(line)
+        if m and not m.group(2):           # active include line
+            target = Path(m.group(3)).expanduser()
+            try:
+                is_inc_rc = target.resolve() == included_rc.resolve()
+            except Exception:
+                is_inc_rc = False
+            if is_inc_rc:
+                has_inc_rc = True
+                new_lines.append(line)     # keep the included.rc pointer
+            else:
+                to_move.append(line)
+                new_lines.append('#' + line)   # comment out in taskrc
+        else:
+            new_lines.append(line)
+
+    if not to_move:
+        return 0, "No active include lines found in .taskrc to migrate"
+
+    included_rc.parent.mkdir(parents=True, exist_ok=True)
+    existing = included_rc.read_text() if included_rc.exists() else ''
+    included_rc.write_text(existing + ''.join(to_move))
+
+    if not has_inc_rc:
+        new_lines.append(f'include {included_rc}\n')
+    taskrc.write_text(''.join(new_lines))
+
+    return len(to_move), ''
+
+
+# ── Display helpers ────────────────────────────────────────────────────────────
+
+def _fmt_name(item, avail):
+    """Format name for hooks/scripts; append '→ parent/' for symlinks."""
+    name = item['name']
+    if item['symlink']:
+        try:
+            parent = item['path'].resolve().parent.name
+            arrow  = f' → {parent}/'
+        except Exception:
+            arrow = ' →'
+        full = name + arrow
+        if len(full) <= avail:
+            return full
+        if len(arrow) + 2 <= avail:
+            return name[:avail - len(arrow)] + arrow
+        return name[:avail]
+    return name[:avail]
+
+
+def _abbrev(path):
+    """Abbreviate a path by replacing home dir with ~."""
+    try:
+        return '~/' + str(path.relative_to(Path.home()))
+    except ValueError:
+        return str(path)
+
+
+# ── Panel drawing ──────────────────────────────────────────────────────────────
+
+def _draw_hooks_panel(stdscr, hooks, cursor, scroll, x, w, h, focused):
+    list_h = h - HDR_ROWS - 1
+
+    # Panel title row (row 1)
+    title = ' Hooks '.center(w)
+    attr  = curses.color_pair(CP_SEL_FOC) | curses.A_BOLD if focused \
+            else curses.color_pair(CP_PTITLE)
+    try:
+        stdscr.addstr(1, x, title[:w], attr)
+    except curses.error:
+        pass
 
     for i, hk in enumerate(hooks):
-        if i < scroll or i >= scroll + list_height:
+        if i < scroll or i >= scroll + list_h:
             continue
-        row = list_top + (i - scroll)
+        row = HDR_ROWS + (i - scroll)
         if row >= h - 1:
             break
 
-        selected    = (i == cursor)
-        is_exec     = hk['executable']
-        label, type_cp, recognized = hook_type(hk['name'])
+        selected = (i == cursor)
+        is_exec  = hk['executable']
+        label_t, type_cp, recognized = hook_type(hk['name'])
 
-        # cursor arrow
-        arrow = ' ► ' if selected else '   '
-        stdscr.addstr(row, 0, arrow,
-                      curses.color_pair(CP_SELECTED) if selected else 0)
-
-        # type tag
-        type_attr = curses.color_pair(CP_SELECTED) if selected else curses.color_pair(type_cp)
-        if not recognized:
-            type_attr = curses.color_pair(CP_UNRECOG) | curses.A_DIM
-        stdscr.addstr(row, 3, f"[{label}]", type_attr)
-
-        # status dot
-        if is_exec:
-            sdot, sattr = ' ● ', curses.color_pair(CP_ENABLED) | curses.A_BOLD
+        if selected and focused:
+            row_attr = curses.color_pair(CP_SEL_FOC)
+        elif selected:
+            row_attr = curses.color_pair(CP_SEL_UNF)
         else:
-            sdot, sattr = ' ○ ', curses.color_pair(CP_DISABLED)
+            row_attr = 0
+
+        # focus arrow (cols 0-2)
+        arrow = ' ► ' if (selected and focused) else '   '
+        try:
+            stdscr.addstr(row, x, arrow, row_attr)
+        except curses.error:
+            pass
+
+        # hook type tag (cols 3-13)
         if selected:
-            sattr = curses.color_pair(CP_SELECTED)
-        stdscr.addstr(row, 14, sdot, sattr)
+            type_attr = row_attr
+        elif recognized:
+            type_attr = curses.color_pair(type_cp)
+        else:
+            type_attr = curses.color_pair(CP_UNRECOG) | curses.A_DIM
+        try:
+            stdscr.addstr(row, x + 3, f'[{label_t}]', type_attr)
+        except curses.error:
+            pass
 
-        # filename (+ symlink marker)
-        name = hk['name']
-        if hk['symlink']:
-            name += ' →'
-        max_name = w - 19
-        name_attr = curses.color_pair(CP_SELECTED) if selected else 0
-        if not recognized:
-            name_attr = curses.color_pair(CP_UNRECOG) | curses.A_DIM
-        stdscr.addstr(row, 18, name[:max_name], name_attr)
+        # status dot (cols 14-16)
+        if is_exec:
+            dot, dot_attr = ' ● ', curses.color_pair(CP_ENABLED) | curses.A_BOLD
+        else:
+            dot, dot_attr = ' ○ ', curses.color_pair(CP_DISABLED)
+        if selected:
+            dot_attr = row_attr
+        try:
+            stdscr.addstr(row, x + 14, dot, dot_attr)
+        except curses.error:
+            pass
 
-    # ── Status bar ────────────────────────────────────────────────────────────
+        # name + symlink target (col 17 onward)
+        name_attr = row_attr if selected else (curses.A_DIM if not recognized else 0)
+        avail = w - 18
+        try:
+            stdscr.addstr(row, x + 17, _fmt_name(hk, avail), name_attr)
+        except curses.error:
+            pass
+
+
+def _draw_scripts_panel(stdscr, scripts, cursor, scroll, x, w, h, focused):
+    list_h = h - HDR_ROWS - 1
+
+    title = ' Scripts '.center(w)
+    attr  = curses.color_pair(CP_SEL_FOC) | curses.A_BOLD if focused \
+            else curses.color_pair(CP_PTITLE)
+    try:
+        stdscr.addstr(1, x, title[:w], attr)
+    except curses.error:
+        pass
+
+    if not scripts:
+        try:
+            stdscr.addstr(HDR_ROWS, x + 2, '(none found)', curses.A_DIM)
+        except curses.error:
+            pass
+        return
+
+    for i, sc in enumerate(scripts):
+        if i < scroll or i >= scroll + list_h:
+            continue
+        row = HDR_ROWS + (i - scroll)
+        if row >= h - 1:
+            break
+
+        selected = (i == cursor)
+        is_exec  = sc['executable']
+
+        if selected and focused:
+            row_attr = curses.color_pair(CP_SEL_FOC)
+        elif selected:
+            row_attr = curses.color_pair(CP_SEL_UNF)
+        else:
+            row_attr = 0
+
+        # focus arrow (cols 0-2)
+        arrow = ' ► ' if (selected and focused) else '   '
+        try:
+            stdscr.addstr(row, x, arrow, row_attr)
+        except curses.error:
+            pass
+
+        # status dot (cols 3-5)
+        if is_exec:
+            dot, dot_attr = ' ● ', curses.color_pair(CP_ENABLED) | curses.A_BOLD
+        else:
+            dot, dot_attr = ' ○ ', curses.color_pair(CP_DISABLED)
+        if selected:
+            dot_attr = row_attr
+        try:
+            stdscr.addstr(row, x + 3, dot, dot_attr)
+        except curses.error:
+            pass
+
+        # name + symlink target (col 7 onward)
+        avail = w - 7
+        try:
+            stdscr.addstr(row, x + 6, _fmt_name(sc, avail), row_attr if selected else 0)
+        except curses.error:
+            pass
+
+
+def _draw_includes_panel(stdscr, inc_items, cursor, scroll, x, w, h, focused):
+    list_h = h - HDR_ROWS - 1
+
+    title = ' Includes '.center(w)
+    attr  = curses.color_pair(CP_SEL_FOC) | curses.A_BOLD if focused \
+            else curses.color_pair(CP_PTITLE)
+    try:
+        stdscr.addstr(1, x, title[:w], attr)
+    except curses.error:
+        pass
+
+    if not inc_items:
+        try:
+            stdscr.addstr(HDR_ROWS, x + 2,
+                          '(no includes found — press m to migrate)',
+                          curses.A_DIM)
+        except curses.error:
+            pass
+        return
+
+    for i, item in enumerate(inc_items):
+        if i < scroll or i >= scroll + list_h:
+            continue
+        row = HDR_ROWS + (i - scroll)
+        if row >= h - 1:
+            break
+
+        if item['type'] == 'header':
+            # ── ~/.taskrc ─────────────────────────────────────
+            src  = _abbrev(item['source'])
+            line = f' ── {src} '
+            line = (line + '─' * max(0, w - len(line)))[:w]
+            try:
+                stdscr.addstr(row, x, line, curses.color_pair(CP_SUBHEAD) | curses.A_BOLD)
+            except curses.error:
+                pass
+
+        else:
+            selected = (i == cursor)
+            if selected and focused:
+                row_attr = curses.color_pair(CP_SEL_FOC)
+            elif selected:
+                row_attr = curses.color_pair(CP_SEL_UNF)
+            else:
+                row_attr = 0
+
+            # focus arrow (cols 0-2)
+            arrow = ' ► ' if (selected and focused) else '   '
+            try:
+                stdscr.addstr(row, x, arrow, row_attr)
+            except curses.error:
+                pass
+
+            # status dot (cols 3-4)
+            if item['active']:
+                dot, dot_attr = '● ', curses.color_pair(CP_ENABLED) | curses.A_BOLD
+            else:
+                dot, dot_attr = '○ ', curses.color_pair(CP_DISABLED)
+            if selected:
+                dot_attr = row_attr
+            try:
+                stdscr.addstr(row, x + 3, dot, dot_attr)
+            except curses.error:
+                pass
+
+            # target path, abbreviated (col 5 onward)
+            target_str = _abbrev(item['target'])
+            avail = w - 6
+            try:
+                stdscr.addstr(row, x + 5, target_str[:avail],
+                              row_attr if selected else 0)
+            except curses.error:
+                pass
+
+
+# ── Main draw ──────────────────────────────────────────────────────────────────
+
+def draw(stdscr, focus,
+         hooks, h_cur, h_scr, hooks_dir,
+         scripts, s_cur, s_scr, scripts_dir,
+         inc_items, i_cur, i_scr, taskrc,
+         message=''):
+    stdscr.erase()
+    h, w = stdscr.getmaxyx()
+
+    if w < MIN_W:
+        msg = f" hook-ctrl: terminal too narrow — need {MIN_W}+ columns (have {w})"
+        try:
+            stdscr.addstr(0, 0, msg[:w - 1], curses.color_pair(CP_HEADER))
+        except curses.error:
+            pass
+        stdscr.refresh()
+        return
+
+    x_scripts = HOOKS_W
+    x_inc     = HOOKS_W + SCRIPTS_W
+    inc_w     = w - x_inc
+
+    # ── Global header (row 0) ─────────────────────────────────────────────────
+    active_h = sum(1 for hk in hooks if hk['executable'])
+    active_s = sum(1 for sc in scripts if sc['executable'])
+    hdr = (f"  hook-ctrl v{VERSION}"
+           f"    hooks {active_h}/{len(hooks)}"
+           f"    scripts {active_s}/{len(scripts)}"
+           f"    Tab focus   q quit")
+    try:
+        stdscr.addstr(0, 0, hdr[:w - 1].ljust(w - 1), curses.color_pair(CP_HEADER))
+    except curses.error:
+        pass
+
+    # ── Three panels ──────────────────────────────────────────────────────────
+    _draw_hooks_panel(   stdscr, hooks,     h_cur, h_scr, 0,         HOOKS_W,   h, focus == 0)
+    _draw_scripts_panel( stdscr, scripts,   s_cur, s_scr, x_scripts, SCRIPTS_W, h, focus == 1)
+    _draw_includes_panel(stdscr, inc_items, i_cur, i_scr, x_inc,     inc_w,     h, focus == 2)
+
+    # ── Status bar (row h-1) ──────────────────────────────────────────────────
     if message:
         bar = f"  {message}"
+    elif focus == 2:
+        bar = "  ↑↓/jk navigate   Space toggle   m migrate from .taskrc   r refresh"
     else:
-        bar = "  ↑↓/jk navigate   SPACE toggle   e enable-all   d disable-all   r refresh   q quit"
-    stdscr.addstr(h - 1, 0, bar[:w - 1].ljust(w - 1), curses.color_pair(CP_STATUS))
+        bar = "  ↑↓/jk navigate   Space toggle   e enable-all   d disable-all   r refresh"
+    try:
+        stdscr.addstr(h - 1, 0, bar[:w - 1].ljust(w - 1), curses.color_pair(CP_STATUS))
+    except curses.error:
+        pass
 
     stdscr.refresh()
 
 
-def init_colors():
-    curses.start_color()
-    curses.use_default_colors()
-    curses.init_pair(CP_ENABLED,  curses.COLOR_GREEN,   -1)
-    curses.init_pair(CP_DISABLED, curses.COLOR_RED,     -1)
-    curses.init_pair(CP_ADD,      curses.COLOR_CYAN,    -1)
-    curses.init_pair(CP_MODIFY,   curses.COLOR_YELLOW,  -1)
-    curses.init_pair(CP_EXIT,     curses.COLOR_MAGENTA, -1)
-    curses.init_pair(CP_LAUNCH,   curses.COLOR_BLUE,    -1)
-    curses.init_pair(CP_SELECTED, curses.COLOR_BLACK,   curses.COLOR_CYAN)
-    curses.init_pair(CP_HEADER,   curses.COLOR_WHITE,   curses.COLOR_BLUE)
-    curses.init_pair(CP_STATUS,   curses.COLOR_BLACK,   curses.COLOR_GREEN)
-    curses.init_pair(CP_SYMLINK,  curses.COLOR_WHITE,   -1)
-    curses.init_pair(CP_UNRECOG,  curses.COLOR_WHITE,   -1)
+# ── Includes navigation helpers ────────────────────────────────────────────────
+
+def _inc_move(inc_items, cur, direction):
+    """Move cursor to next/prev item of type 'include', skipping headers."""
+    n = len(inc_items)
+    i = cur + direction
+    while 0 <= i < n:
+        if inc_items[i]['type'] == 'include':
+            return i
+        i += direction
+    return cur   # no selectable item in that direction, stay put
 
 
-def run(stdscr, hooks_dir):
+def _inc_first(inc_items):
+    return next((i for i, it in enumerate(inc_items) if it['type'] == 'include'), 0)
+
+
+def _inc_last(inc_items):
+    return next((i for i, it in reversed(list(enumerate(inc_items)))
+                 if it['type'] == 'include'), 0)
+
+
+def _inc_clamp_scroll(cur, scroll, list_h):
+    if cur < scroll:
+        return cur
+    if cur >= scroll + list_h:
+        return cur - list_h + 1
+    return scroll
+
+
+# ── Migration popup ────────────────────────────────────────────────────────────
+
+def _show_popup(stdscr, title, lines, h, w):
+    inner_w  = max(len(title) + 2, max((len(l) for l in lines), default=0) + 4)
+    pop_w    = min(inner_w + 4, w - 4)
+    pop_h    = min(len(lines) + 4, h - 4)
+    y        = (h - pop_h) // 2
+    x        = (w - pop_w) // 2
+    win      = curses.newwin(pop_h, pop_w, y, x)
+    win.erase()
+    win.border()
+    try:
+        win.addstr(0, max(1, (pop_w - len(title)) // 2), title,
+                   curses.color_pair(CP_HEADER) | curses.A_BOLD)
+    except curses.error:
+        pass
+    for i, line in enumerate(lines[:pop_h - 2]):
+        try:
+            win.addstr(i + 1, 2, line[:pop_w - 4])
+        except curses.error:
+            pass
+    win.refresh()
+    return win
+
+
+def _confirm_migrate(stdscr, taskrc, included_rc, h, w):
+    """Show preview popup; return (count_moved, error_str) or (0, '') if cancelled."""
+    try:
+        lines = taskrc.read_text().splitlines(keepends=True)
+    except Exception as e:
+        return 0, str(e)
+
+    to_show = []
+    for line in lines:
+        m = _INC_RE.match(line)
+        if m and not m.group(2):
+            target = Path(m.group(3)).expanduser()
+            try:
+                is_inc = target.resolve() == included_rc.resolve()
+            except Exception:
+                is_inc = False
+            if not is_inc:
+                to_show.append(m.group(3))
+
+    if not to_show:
+        win = _show_popup(stdscr, " Nothing to migrate ",
+                          ["No active include lines found in .taskrc",
+                           "(already migrated, or none exist)",
+                           "", "Press any key…"], h, w)
+        stdscr.getch()
+        del win
+        return 0, ''
+
+    popup_lines = (
+        [f"Move {len(to_show)} include(s) from .taskrc → {included_rc.name}?", ""]
+        + [f"  {t}" for t in to_show]
+        + ["",
+           f"Lines in .taskrc will be commented out.",
+           f"'include {_abbrev(included_rc)}' will be appended.",
+           "",
+           "  y = proceed    any other key = cancel"]
+    )
+    win = _show_popup(stdscr, " Migrate Includes ", popup_lines, h, w)
+    key = stdscr.getch()
+    del win
+
+    if key not in (ord('y'), ord('Y')):
+        return 0, ''
+    return migrate_includes(taskrc, included_rc)
+
+
+# ── Main loop ──────────────────────────────────────────────────────────────────
+
+def run(stdscr, hooks_dir, scripts_dir, taskrc, dev=False):
     curses.curs_set(0)
     init_colors()
     stdscr.keypad(True)
 
+    focus = 0
+
     hooks   = load_hooks(hooks_dir)
-    cursor  = 0
-    scroll  = 0
+    h_cur, h_scr = 0, 0
+
+    scripts = load_scripts(scripts_dir)
+    s_cur, s_scr = 0, 0
+
+    inc_items = walk_includes(taskrc)
+    i_cur     = _inc_first(inc_items)
+    i_scr     = 0
+
     message = ''
 
-    if not hooks:
-        stdscr.addstr(0, 0, f"No hooks found in {hooks_dir}")
-        stdscr.getch()
-        return
-
     while True:
-        h, _ = stdscr.getmaxyx()
-        list_height = h - 4
+        h, w   = stdscr.getmaxyx()
+        list_h = h - HDR_ROWS - 1
 
-        # Keep scroll window around cursor
-        if cursor < scroll:
-            scroll = cursor
-        elif cursor >= scroll + list_height:
-            scroll = cursor - list_height + 1
+        # Clamp exec-panel cursors
+        if hooks:
+            h_cur = max(0, min(h_cur, len(hooks) - 1))
+        if scripts:
+            s_cur = max(0, min(s_cur, len(scripts) - 1))
 
-        draw(stdscr, hooks, cursor, scroll, hooks_dir, message)
+        # Scroll: hooks
+        if h_cur < h_scr:
+            h_scr = h_cur
+        elif h_cur >= h_scr + list_h:
+            h_scr = h_cur - list_h + 1
+
+        # Scroll: scripts
+        if s_cur < s_scr:
+            s_scr = s_cur
+        elif s_cur >= s_scr + list_h:
+            s_scr = s_cur - list_h + 1
+
+        # Scroll: includes
+        i_scr = _inc_clamp_scroll(i_cur, i_scr, list_h)
+
+        draw(stdscr, focus,
+             hooks,     h_cur, h_scr, hooks_dir,
+             scripts,   s_cur, s_scr, scripts_dir,
+             inc_items, i_cur, i_scr, taskrc,
+             message)
         message = ''
 
         key = stdscr.getch()
 
+        # ── Global ────────────────────────────────────────────────────────────
         if key in (ord('q'), ord('Q'), 27):
             break
 
-        elif key in (curses.KEY_UP, ord('k')):
-            if cursor > 0:
-                cursor -= 1
-
-        elif key in (curses.KEY_DOWN, ord('j')):
-            if cursor < len(hooks) - 1:
-                cursor += 1
-
-        elif key == ord('g'):
-            cursor = 0
-
-        elif key == ord('G'):
-            cursor = len(hooks) - 1
-
-        elif key in (ord(' '), 10, 13):  # space / enter
-            toggle(hooks[cursor])
-            hooks = load_hooks(hooks_dir)
-            name = hooks[cursor]['name'] if cursor < len(hooks) else ''
-            state = 'enabled' if hooks[cursor]['executable'] else 'disabled'
-            message = f"{name} → {state}"
-
-        elif key == ord('e'):
-            set_all(hooks, True)
-            hooks = load_hooks(hooks_dir)
-            message = f"All {len(hooks)} hooks enabled"
-
-        elif key == ord('d'):
-            set_all(hooks, False)
-            hooks = load_hooks(hooks_dir)
-            message = f"All {len(hooks)} hooks disabled"
+        elif key == ord('\t'):
+            focus = (focus + 1) % 3
 
         elif key == ord('r'):
-            hooks  = load_hooks(hooks_dir)
-            cursor = min(cursor, len(hooks) - 1)
-            message = "Refreshed"
+            hooks     = load_hooks(hooks_dir)
+            scripts   = load_scripts(scripts_dir)
+            inc_items = walk_includes(taskrc)
+            if hooks:
+                h_cur = min(h_cur, len(hooks) - 1)
+            if scripts:
+                s_cur = min(s_cur, len(scripts) - 1)
+            i_cur   = _inc_first(inc_items)
+            i_scr   = 0
+            message = 'Refreshed'
 
         elif key == curses.KEY_RESIZE:
-            pass  # redraw on next loop
+            pass
 
+        # ── Navigation ────────────────────────────────────────────────────────
+        elif key in (curses.KEY_UP, ord('k')):
+            if focus == 0 and h_cur > 0:
+                h_cur -= 1
+            elif focus == 1 and s_cur > 0:
+                s_cur -= 1
+            elif focus == 2:
+                i_cur = _inc_move(inc_items, i_cur, -1)
+
+        elif key in (curses.KEY_DOWN, ord('j')):
+            if focus == 0 and h_cur < len(hooks) - 1:
+                h_cur += 1
+            elif focus == 1 and s_cur < len(scripts) - 1:
+                s_cur += 1
+            elif focus == 2:
+                i_cur = _inc_move(inc_items, i_cur, +1)
+
+        elif key == ord('g'):
+            if focus == 0:
+                h_cur = 0;              h_scr = 0
+            elif focus == 1:
+                s_cur = 0;              s_scr = 0
+            else:
+                i_cur = _inc_first(inc_items); i_scr = 0
+
+        elif key == ord('G'):
+            if focus == 0:
+                h_cur = max(0, len(hooks) - 1)
+            elif focus == 1:
+                s_cur = max(0, len(scripts) - 1)
+            else:
+                i_cur = _inc_last(inc_items)
+
+        # ── Space / Enter: toggle ─────────────────────────────────────────────
+        elif key in (ord(' '), 10, 13):
+            if focus == 0 and hooks:
+                toggle_exec(hooks[h_cur])
+                hooks   = load_hooks(hooks_dir)
+                state   = 'enabled' if hooks[h_cur]['executable'] else 'disabled'
+                message = f"{hooks[h_cur]['name']} → {state}"
+
+            elif focus == 1 and scripts:
+                toggle_exec(scripts[s_cur])
+                scripts = load_scripts(scripts_dir)
+                state   = 'enabled' if scripts[s_cur]['executable'] else 'disabled'
+                message = f"{scripts[s_cur]['name']} → {state}"
+
+            elif focus == 2 and inc_items:
+                item = inc_items[i_cur]
+                if item['type'] == 'include':
+                    ok, err = toggle_include(item)
+                    if ok:
+                        action    = 'disabled' if item['active'] else 'enabled'
+                        message   = f"{action}: {_abbrev(item['target'])}"
+                    else:
+                        message = err
+                    old_cur   = i_cur
+                    inc_items = walk_includes(taskrc)
+                    # Snap cursor back to nearest include-type item
+                    i_cur = min(old_cur, len(inc_items) - 1)
+                    while i_cur > 0 and inc_items[i_cur]['type'] != 'include':
+                        i_cur -= 1
+
+        # ── Enable / disable all (hooks and scripts only) ─────────────────────
+        elif key == ord('e') and focus in (0, 1):
+            if focus == 0:
+                set_all_exec(hooks, True)
+                hooks   = load_hooks(hooks_dir)
+                message = f"All {len(hooks)} hooks enabled"
+            else:
+                set_all_exec(scripts, True)
+                scripts = load_scripts(scripts_dir)
+                message = f"All {len(scripts)} scripts enabled"
+
+        elif key == ord('d') and focus in (0, 1):
+            if focus == 0:
+                set_all_exec(hooks, False)
+                hooks   = load_hooks(hooks_dir)
+                message = f"All {len(hooks)} hooks disabled"
+            else:
+                set_all_exec(scripts, False)
+                scripts = load_scripts(scripts_dir)
+                message = f"All {len(scripts)} scripts disabled"
+
+        # ── Migrate (includes panel only) ─────────────────────────────────────
+        elif key == ord('m') and focus == 2:
+            included_rc   = get_included_rc(dev=dev)
+            count, err    = _confirm_migrate(stdscr, taskrc, included_rc, h, w)
+            stdscr.clear()   # repaint fully after popup
+            if count > 0:
+                inc_items = walk_includes(taskrc)
+                i_cur     = _inc_first(inc_items)
+                i_scr     = 0
+                message   = f"Migrated {count} include(s) → {included_rc.name}"
+            elif err:
+                message   = f"Migration failed: {err}"
+            # (count==0, err=='' means cancelled — no message)
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
 
 def main():
     import argparse
     parser = argparse.ArgumentParser(
-        description=f"hook-ctrl v{VERSION} — toggle Taskwarrior hook permissions"
+        description=f"hook-ctrl v{VERSION} — Taskwarrior hooks, scripts & includes dashboard"
     )
     parser.add_argument('--dir', metavar='PATH',
-                        help='hooks directory (default: from active TASKRC)')
+                        help='hooks directory (overrides auto-detection)')
     parser.add_argument('--dev', action='store_true',
-                        help='use ~/.task-dev/hooks (dev environment)')
+                        help='use ~/.task-dev/ environment')
     parser.add_argument('--version', action='version', version=f'%(prog)s {VERSION}')
     args = parser.parse_args()
 
-    hooks_dir = get_hooks_dir(args.dir, dev=args.dev)
+    hooks_dir   = get_hooks_dir(args.dir, dev=args.dev)
+    scripts_dir = get_scripts_dir(dev=args.dev)
+    taskrc      = get_taskrc()
 
     if not hooks_dir.exists():
         print(f"Hooks directory not found: {hooks_dir}", file=sys.stderr)
         sys.exit(1)
 
     try:
-        curses.wrapper(run, hooks_dir)
+        curses.wrapper(run, hooks_dir, scripts_dir, taskrc, args.dev)
     except KeyboardInterrupt:
         pass
 
