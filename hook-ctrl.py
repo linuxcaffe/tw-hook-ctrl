@@ -275,7 +275,7 @@ def set_all_exec(items, enable):
 
 # ── Includes ───────────────────────────────────────────────────────────────────
 
-def walk_includes(start_path, max_depth=10):
+def walk_includes(start_path, max_depth=1):
     """Recursively walk the include tree from start_path.
 
     Collects only include= lines (no other config).  Returns a flat list of
@@ -286,7 +286,10 @@ def walk_includes(start_path, max_depth=10):
        'text': str, 'active': bool, 'target': Path}
 
     Files with no include lines produce no header.
-    Depth-limited and visited-set guarded against cycles.
+    Depth-limited (default 1: shows .taskrc and included.rc contents, no
+    deeper) and visited-set guarded against cycles.  Files at depth 2+ are
+    typically tool-managed (themes.rc, uda.rc…) — their internal includes
+    are that tool's business, not this panel's.
     """
     visited = set()
     result  = []
