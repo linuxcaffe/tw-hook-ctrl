@@ -89,7 +89,7 @@ import curses
 import stat
 import subprocess
 
-VERSION = "0.2.0"
+VERSION = "0.3.3"
 
 # Panel widths (includes panel gets the remainder)
 HOOKS_W   = 38
